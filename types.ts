@@ -64,6 +64,17 @@ export interface SessionInfo {
   herdrLocation?: HerdrLocation;
 }
 
+export interface CrossMachineOrigin {
+  name: string;
+  sessionId: string;
+  machine: string;
+}
+
+export interface CrossMachineProvenance {
+  origin: CrossMachineOrigin;
+  trust: "ssh-asserted";
+}
+
 export interface Message {
   id: string;
   timestamp: number;
@@ -77,6 +88,7 @@ export interface Message {
   replyTo?: string;
   expectsReply?: boolean;
   provenance?: MessageProvenance;
+  crossMachine?: CrossMachineProvenance;
   content: {
     text: string;
     attachments?: Attachment[];

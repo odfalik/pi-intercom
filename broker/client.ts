@@ -9,6 +9,7 @@ import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from 
 import type {
   Attachment,
   BrokerMessage,
+  CrossMachineProvenance,
   ClientMessage,
   Message,
   MessageControl,
@@ -27,6 +28,7 @@ interface SendOptions {
   supersedes?: string;
   retryOf?: string;
   provenance?: MessageProvenance;
+  crossMachine?: CrossMachineProvenance;
 }
 
 export interface SendResult extends DeliveryDetails {
@@ -636,6 +638,7 @@ export class IntercomClient extends EventEmitter {
       replyTo: options.replyTo,
       expectsReply: options.expectsReply,
       provenance: options.provenance,
+      crossMachine: options.crossMachine,
       content: {
         text: options.text,
         attachments: options.attachments,

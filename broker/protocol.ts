@@ -101,6 +101,13 @@ function isMessageProvenance(value: unknown): value is MessageProvenance {
     && typeof value.requestId === "string";
 }
 
+function isCrossMachineProvenance(value: unknown): boolean {
+  if (!isRecord(value) || value.trust !== "ssh-asserted" || !isRecord(value.origin)) return false;
+  return typeof value.origin.name === "string"
+    && typeof value.origin.sessionId === "string"
+    && typeof value.origin.machine === "string";
+}
+
 export function isMessage(value: unknown): value is Message {
   if (!isRecord(value)) {
     return false;
@@ -133,6 +140,9 @@ export function isMessage(value: unknown): value is Message {
   }
 
   if (value.provenance !== undefined && !isMessageProvenance(value.provenance)) {
+    return false;
+  }
+  if (value.crossMachine !== undefined && !isCrossMachineProvenance(value.crossMachine)) {
     return false;
   }
 

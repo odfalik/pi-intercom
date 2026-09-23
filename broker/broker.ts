@@ -1075,6 +1075,7 @@ class IntercomBroker {
       supersedes: message.supersedes,
       retryOf: message.retryOf,
       provenance: message.provenance,
+      crossMachine: message.crossMachine,
     });
   }
 

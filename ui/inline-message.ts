@@ -36,7 +36,9 @@ export class InlineMessageComponent implements Component {
   render(width: number): string[] {
     const lines: string[] = [];
     const borderChar = "─";
-    const senderName = this.from.name || this.from.id.slice(0, 8);
+    const senderName = this.message.crossMachine
+      ? `${this.message.crossMachine.origin.name}@${this.message.crossMachine.origin.machine} · unverified cross-machine`
+      : this.from.name || this.from.id.slice(0, 8);
     if (width < 3) {
       return [truncateToWidth(`From ${senderName}`, width)];
     }

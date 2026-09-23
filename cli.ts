@@ -21,17 +21,30 @@
 
 import { pathToFileURL } from "node:url";
 import { IntercomClient } from "./broker/client.ts";
-import type { Message, SessionInfo, SessionRegistration } from "./types.ts";
+import { loadConfig } from "./config.ts";
+import {
+  parseRelayEnvelope,
+  relayMessage,
+  relaySenderName,
+  resolveOrigin,
+  sendCrossMachine,
+  type CrossMachineDelivery,
+  type CrossMachineEnvelope,
+} from "./cross-machine.ts";
+import type { CrossMachineProvenance, Message, SessionInfo, SessionRegistration } from "./types.ts";
 
-export const CLI_USAGE = `usage: cli.ts <list|send|ask> [--to <name|session-id>] [--text <message>]
-                        [--timeout-ms <n>] [--name <session-name>] [--json]`;
+export const CLI_USAGE = `usage: cli.ts <list|send|ask> [--to <name|session-id>] [--text <message>|--text-stdin]
+                        [--timeout-ms <n>] [--name <session-name>] [--json]
+       cli.ts relay --envelope-stdin [--json]`;
 
 export const DEFAULT_ASK_TIMEOUT_MS = 120_000;
 
 export interface CliOptions {
-  command: "list" | "send" | "ask";
+  command: "list" | "send" | "ask" | "relay";
   to: string | null;
   text: string | null;
+  textStdin: boolean;
+  envelopeStdin: boolean;
   timeoutMs: number;
   name: string;
   json: boolean;
@@ -44,13 +57,15 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     command: null as unknown as CliOptions["command"],
     to: null,
     text: null,
+    textStdin: false,
+    envelopeStdin: false,
     timeoutMs: DEFAULT_ASK_TIMEOUT_MS,
     name: "pi-intercom-cli",
     json: false,
   };
 
   const [command, ...rest] = argv;
-  if (command !== "list" && command !== "send" && command !== "ask") {
+  if (command !== "list" && command !== "send" && command !== "ask" && command !== "relay") {
     throw new CliUsageError(`unknown command: ${String(command)}\n${CLI_USAGE}`);
   }
   opts.command = command;
@@ -59,6 +74,14 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     const arg = rest[i];
     if (arg === "--json") {
       opts.json = true;
+      continue;
+    }
+    if (arg === "--text-stdin") {
+      opts.textStdin = true;
+      continue;
+    }
+    if (arg === "--envelope-stdin") {
+      opts.envelopeStdin = true;
       continue;
     }
     const value = rest[i + 1];
@@ -83,12 +106,18 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
     i++;
   }
 
-  if (opts.command !== "list") {
-    if (!opts.to) {
-      throw new CliUsageError(`--to is required for ${opts.command}\n${CLI_USAGE}`);
+  if (opts.command === "relay") {
+    if (!opts.envelopeStdin || opts.to || opts.text || opts.textStdin || opts.name !== "pi-intercom-cli") {
+      throw new CliUsageError(`relay requires only --envelope-stdin (and optional --json)\n${CLI_USAGE}`);
     }
-    if (!opts.text) {
-      throw new CliUsageError(`--text is required for ${opts.command}\n${CLI_USAGE}`);
+  } else {
+    if (opts.envelopeStdin) throw new CliUsageError(`--envelope-stdin is only valid for relay\n${CLI_USAGE}`);
+    if (opts.text && opts.textStdin) throw new CliUsageError("use either --text or --text-stdin, not both");
+    if (opts.command !== "list") {
+      if (!opts.to) throw new CliUsageError(`--to is required for ${opts.command}\n${CLI_USAGE}`);
+      if (!opts.text && !opts.textStdin) throw new CliUsageError(`--text or --text-stdin is required for ${opts.command}\n${CLI_USAGE}`);
+    } else if (opts.textStdin) {
+      throw new CliUsageError(`--text-stdin is only valid for send/ask\n${CLI_USAGE}`);
     }
   }
 
@@ -97,9 +126,10 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
 
 /** The part of IntercomClient the CLI uses; injectable for tests. */
 export interface CliClient {
+  sessionId?: string | null;
   connect(session: SessionRegistration, sessionId?: string): Promise<void>;
   listSessions(options?: { timeoutMs?: number }): Promise<SessionInfo[]>;
-  send(to: string, options: { text: string; expectsReply?: boolean }): Promise<{ id: string; delivered: boolean; reason?: string }>;
+  send(to: string, options: { text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance }): Promise<{ id: string; delivered: boolean; reason?: string }>;
   on(event: "message", listener: (from: SessionInfo, message: Message) => void): unknown;
   disconnect(): Promise<void>;
 }
@@ -108,9 +138,13 @@ export interface CliDeps {
   client: CliClient;
   out?: { write(chunk: string): unknown };
   err?: { write(chunk: string): unknown };
+  readStdin?: () => Promise<string>;
+  crossMachineSend?: (target: string, text: string, origin: ReturnType<typeof resolveOrigin>) => Promise<CrossMachineDelivery>;
+  machineName?: string;
+  implicitCrossMachineFallback?: boolean;
 }
 
-export function buildCliRegistration(name: string, now = Date.now()): SessionRegistration {
+export function buildCliRegistration(name: string, now = Date.now(), runtimeFallbackAlias = false): SessionRegistration {
   return {
     cwd: process.cwd(),
     model: "pi-intercom-cli",
@@ -118,6 +152,7 @@ export function buildCliRegistration(name: string, now = Date.now()): SessionReg
     startedAt: now,
     lastActivity: now,
     name,
+    ...(runtimeFallbackAlias ? { runtimeFallbackAlias: true } : {}),
     status: "idle",
   };
 }
@@ -144,14 +179,18 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
     return code;
   };
   let opts: CliOptions;
+  let relayEnvelope: CrossMachineEnvelope | undefined;
   try {
     opts = parseCliArgs(argv);
+    if (opts.textStdin) opts.text = await (deps.readStdin ?? readProcessStdin)();
+    if (opts.command === "relay") relayEnvelope = parseRelayEnvelope(await (deps.readStdin ?? readProcessStdin)());
   } catch (error) {
     return reportFailure(error instanceof Error ? error.message : String(error));
   }
 
+  const registrationName = relayEnvelope ? relaySenderName(relayEnvelope.origin) : opts.name;
   try {
-    await deps.client.connect(buildCliRegistration(opts.name));
+    await deps.client.connect(buildCliRegistration(registrationName, Date.now(), Boolean(relayEnvelope)));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return reportFailure(`cannot reach the local intercom broker: ${message}\nis a pi session with pi-intercom loaded currently running on this machine?`);
@@ -171,10 +210,43 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
       return 0;
     }
 
+    if (opts.command === "relay") {
+      const envelope = relayEnvelope!;
+      const result = await deps.client.send(envelope.target, {
+        text: relayMessage(envelope),
+        crossMachine: { origin: envelope.origin, trust: envelope.trust },
+      });
+      if (!result.delivered) return reportFailure(`relay delivery failed: ${result.reason ?? "unknown reason"}`);
+      if (opts.json) out.write(`${JSON.stringify({ ok: true, delivered: true, id: result.id, origin: relaySenderName(envelope.origin), trust: envelope.trust })}\n`);
+      else out.write(`relayed from ${relaySenderName(envelope.origin)} to ${envelope.target} (${result.id})\n`);
+      return 0;
+    }
+
     if (opts.command === "send") {
+      if (deps.crossMachineSend && opts.to!.includes("@")) {
+        try {
+          const sessions = await deps.client.listSessions();
+          const remote = await deps.crossMachineSend(opts.to as string, opts.text as string, resolveOrigin(sessions, opts.name, deps.machineName ?? "localhost", deps.client.sessionId));
+          if (opts.json) out.write(`${JSON.stringify({ ok: true, delivered: true, crossMachine: true, machine: remote.machine.label, target: remote.agent.name })}\n`);
+          else out.write(`delivered to ${remote.agent.name}@${remote.machine.label} over SSH\n`);
+          return 0;
+        } catch (error) {
+          return reportFailure(`explicit cross-machine delivery failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       const result = await deps.client.send(opts.to as string, { text: opts.text as string });
       if (!result.delivered) {
-        return reportFailure(`delivery failed: ${result.reason ?? "unknown reason"}`);
+        const targetMissing = (result as { code?: string }).code === "E_TARGET_NOT_FOUND" || result.reason === "Session not found";
+        if (!deps.crossMachineSend || deps.implicitCrossMachineFallback === false || !targetMissing) return reportFailure(`delivery failed: ${result.reason ?? "unknown reason"}`);
+        try {
+          const sessions = await deps.client.listSessions();
+          const remote = await deps.crossMachineSend(opts.to as string, opts.text as string, resolveOrigin(sessions, opts.name, deps.machineName ?? "localhost", deps.client.sessionId));
+          if (opts.json) out.write(`${JSON.stringify({ ok: true, delivered: true, crossMachine: true, machine: remote.machine.label, target: remote.agent.name })}\n`);
+          else out.write(`delivered to ${remote.agent.name}@${remote.machine.label} over SSH\n`);
+          return 0;
+        } catch (error) {
+          return reportFailure(`delivery failed locally (${result.reason ?? "unknown reason"}) and cross-machine delivery failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
       }
       if (opts.json) {
         out.write(`${JSON.stringify({ ok: true, delivered: true, id: result.id }, null, 2)}\n`);
@@ -247,10 +319,29 @@ export async function runCli(argv: readonly string[], deps: CliDeps): Promise<nu
   }
 }
 
+async function readProcessStdin(): Promise<string> {
+  let value = "";
+  process.stdin.setEncoding("utf8");
+  for await (const chunk of process.stdin) value += chunk;
+  return value;
+}
+
+export async function runMain(argv: readonly string[] = process.argv.slice(2)): Promise<number> {
+  const config = loadConfig();
+  return runCli(argv, {
+    client: new IntercomClient(),
+    machineName: config.crossMachine.machineName,
+    implicitCrossMachineFallback: config.crossMachine.implicitFallback,
+    crossMachineSend: (target, text, origin) => sendCrossMachine(target, text, origin, {
+      remoteCommand: config.crossMachine.remoteCommand,
+      remoteCommandByMachine: config.crossMachine.remoteCommandByMachine,
+    }),
+  });
+}
+
 const invokedAsScript = process.argv[1] !== undefined
   && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (invokedAsScript) {
-  const code = await runCli(process.argv.slice(2), { client: new IntercomClient() });
-  process.exit(code);
+  process.exit(await runMain());
 }

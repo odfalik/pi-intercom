@@ -8,7 +8,7 @@ import {
   runCli,
   type CliClient,
 } from "./cli.ts";
-import type { Message, SessionInfo, SessionRegistration } from "./types.ts";
+import type { CrossMachineProvenance, Message, SessionInfo, SessionRegistration } from "./types.ts";
 
 class MemorySink {
   chunks: string[] = [];
@@ -32,7 +32,7 @@ interface FakeClientOptions {
 
 class FakeClient implements CliClient {
   registrations: SessionRegistration[] = [];
-  sends: Array<{ to: string; text: string; expectsReply?: boolean }> = [];
+  sends: Array<{ to: string; text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance }> = [];
   disconnected = false;
   private readonly options: FakeClientOptions;
   private listeners: Array<(from: SessionInfo, message: Message) => void> = [];
@@ -51,8 +51,8 @@ class FakeClient implements CliClient {
     return this.options.sessions ?? [];
   }
 
-  async send(to: string, options: { text: string; expectsReply?: boolean }): Promise<{ id: string; delivered: boolean; reason?: string }> {
-    this.sends.push({ to, text: options.text, expectsReply: options.expectsReply });
+  async send(to: string, options: { text: string; expectsReply?: boolean; crossMachine?: CrossMachineProvenance }): Promise<{ id: string; delivered: boolean; reason?: string }> {
+    this.sends.push({ to, text: options.text, expectsReply: options.expectsReply, ...(options.crossMachine ? { crossMachine: options.crossMachine } : {}) });
     if (this.options.sendError) {
       throw this.options.sendError;
     }
@@ -134,8 +134,8 @@ test("parseCliArgs rejects invalid timeout values", () => {
 
 test("parseCliArgs requires --to and --text for send/ask", () => {
   assert.throws(() => parseCliArgs(["send", "--text", "hi"]), /--to is required/);
-  assert.throws(() => parseCliArgs(["send", "--to", "w"]), /--text is required/);
-  assert.throws(() => parseCliArgs(["ask", "--to", "w"]), /--text is required/);
+  assert.throws(() => parseCliArgs(["send", "--to", "w"]), /--text or --text-stdin is required/);
+  assert.throws(() => parseCliArgs(["ask", "--to", "w"]), /--text or --text-stdin is required/);
 });
 
 test("buildCliRegistration fills required session fields", () => {
@@ -188,6 +188,74 @@ test("runCli send exits 1 on delivery failure", async () => {
   const code = await runCli(["send", "--to", "ghost", "--text", "hi"], { client, out, err });
   assert.equal(code, 1);
   assert.match(err.text(), /delivery failed: Session not found/);
+});
+
+test("runCli falls back to cross-machine send after local failure", async () => {
+  const client = new FakeClient({ sendResult: { id: "sent-1", delivered: false, reason: "Session not found" } });
+  const out = new MemorySink();
+  const code = await runCli(["send", "--to", "reviewer", "--text-stdin", "--name", "worker", "--json"], {
+    client,
+    out,
+    err: new MemorySink(),
+    readStdin: async () => "hello",
+    crossMachineSend: async (target, text, origin) => {
+      assert.equal(target, "reviewer");
+      assert.equal(text, "hello");
+      assert.equal(origin.name, "worker");
+      return { machine: { label: "workstation", target: "workstation.example", enabled: true }, agent: { name: "reviewer" }, stdout: "" };
+    },
+  });
+  assert.equal(code, 0);
+  assert.deepEqual(JSON.parse(out.text()), { ok: true, delivered: true, crossMachine: true, machine: "workstation", target: "reviewer" });
+});
+
+test("runCli can disable implicit cross-machine fallback", async () => {
+  const client = new FakeClient({ sendResult: { id: "sent-1", delivered: false, reason: "Session not found" } });
+  let attempted = false;
+  const code = await runCli(["send", "--to", "reviewer", "--text", "hello"], {
+    client,
+    out: new MemorySink(),
+    err: new MemorySink(),
+    implicitCrossMachineFallback: false,
+    crossMachineSend: async () => {
+      attempted = true;
+      throw new Error("should not run");
+    },
+  });
+  assert.equal(code, 1);
+  assert.equal(attempted, false);
+});
+
+test("runCli treats name@machine as an explicit remote address before local delivery", async () => {
+  const client = new FakeClient();
+  const code = await runCli(["send", "--to", "reviewer@workstation", "--text", "hello"], {
+    client,
+    out: new MemorySink(),
+    err: new MemorySink(),
+    crossMachineSend: async () => ({ machine: { label: "workstation", target: "workstation.example", enabled: true }, agent: { name: "reviewer" }, stdout: "" }),
+  });
+  assert.equal(code, 0);
+  assert.equal(client.sends.length, 0);
+});
+
+test("runCli relay registers an ephemeral asserted sender and forwards the envelope", async () => {
+  const client = new FakeClient();
+  const out = new MemorySink();
+  const code = await runCli(["relay", "--envelope-stdin", "--json"], {
+    client,
+    out,
+    err: new MemorySink(),
+    readStdin: async () => JSON.stringify({ version: 1, target: "reviewer", text: "hello", trust: "ssh-asserted", origin: { name: "worker", sessionId: "00000000-0000-4000-8000-000000000001", machine: "laptop" } }),
+  });
+  assert.equal(code, 0);
+  assert.equal(client.registrations[0]?.name, "worker@laptop");
+  assert.equal(client.registrations[0]?.runtimeFallbackAlias, true);
+  assert.equal(client.sends[0]?.to, "reviewer");
+  assert.equal(client.sends[0]?.text, "[Unverified cross-machine origin]\nhello");
+  assert.deepEqual(client.sends[0]?.crossMachine, {
+    origin: { name: "worker", sessionId: "00000000-0000-4000-8000-000000000001", machine: "laptop" },
+    trust: "ssh-asserted",
+  });
 });
 
 test("runCli ask prints the reply", async () => {

@@ -51,6 +51,20 @@ test("expanded inline intercom messages show the full body without collapse cont
   assert.doesNotMatch(rendered, /Ctrl\+O/);
 });
 
+test("cross-machine messages label the asserted identity as unverified", () => {
+  const component = new InlineMessageComponent(from, {
+    ...message,
+    crossMachine: {
+      origin: { name: "worker", sessionId: "00000000-0000-4000-8000-000000000001", machine: "laptop" },
+      trust: "ssh-asserted",
+    },
+  }, theme as any, 'intercom({ action: "send", to: "worker@laptop", message: "..." })');
+
+  const rendered = component.render(120).join("\n");
+  assert.match(rendered, /worker@laptop · unverified cross-machine/);
+  assert.match(rendered, /To reply: intercom/);
+});
+
 test("collapsed inline intercom messages keep preview, reply hint, and expand key visible", () => {
   const component = new InlineMessageComponent(
     from,
